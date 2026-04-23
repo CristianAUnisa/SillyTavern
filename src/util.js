@@ -702,11 +702,12 @@ export function getImages(directoryPath, sortBy = 'name', type = MEDIA_REQUEST_T
 
 /**
  * Pipe a fetch() response to an Express.js Response, including status code.
- * @param {import('node-fetch').Response} from The Fetch API response to pipe from.
+ * @param {Response} from The Fetch API response to pipe from.
  * @param {import('express').Response} to The Express response to pipe to.
+ * @param {number} socketTimeoutMs Socket timeout for the outgoing response stream.
  * @returns {Promise<void>}
  */
-export async function forwardFetchResponse(from, to) {
+export async function forwardFetchResponse(from, to, socketTimeoutMs = 120000) {
     let statusCode = from.status;
     let statusText = from.statusText;
 
@@ -738,17 +739,75 @@ export async function forwardFetchResponse(from, to) {
     }
 
     if (from.body && to.socket) {
-        from.body.pipe(to);
+        if (Number.isFinite(socketTimeoutMs) && socketTimeoutMs > 0) {
+            to.socket.setTimeout(socketTimeoutMs);
+        }
 
-        to.socket.on('close', function () {
-            if (from.body instanceof Readable) from.body.destroy(); // Close the remote stream
+        const bodyStream = from.body instanceof Readable
+            ? from.body
+            : Readable.fromWeb(/** @type {any} */ (from.body));
 
-            to.end(); // End the Express response
+        const contentType = from.headers.get('content-type') || '';
+        const isSse = contentType.toLowerCase().includes('text/event-stream');
+        /** @type {NodeJS.Timeout | null} */
+        let keepAliveTimer = null;
+
+        // Prevent intermediate network devices from closing idle SSE streams.
+        if (isSse) {
+            keepAliveTimer = setInterval(() => {
+                if (!to.writableEnded && !to.destroyed) {
+                    to.write(': keepalive\n\n');
+                }
+            }, 25000);
+        }
+
+        bodyStream.pipe(to);
+
+        const cleanup = () => {
+            if (keepAliveTimer) {
+                clearInterval(keepAliveTimer);
+                keepAliveTimer = null;
+            }
+        };
+
+        to.socket.on('timeout', function () {
+            cleanup();
+            console.warn(`Streaming response timed out after ${socketTimeoutMs}ms`);
+
+            if (!bodyStream.destroyed) {
+                bodyStream.destroy();
+            }
+
+            if (!to.writableEnded) {
+                to.end();
+            }
         });
 
-        from.body.on('end', function () {
+        to.socket.on('close', function () {
+            cleanup();
+            if (!bodyStream.destroyed) {
+                bodyStream.destroy(); // Close the remote stream
+            }
+
+            if (!to.writableEnded) {
+                to.end(); // End the Express response
+            }
+        });
+
+        bodyStream.on('end', function () {
+            cleanup();
             console.info('Streaming request finished');
-            to.end();
+            if (!to.writableEnded) {
+                to.end();
+            }
+        });
+
+        bodyStream.on('error', function (error) {
+            cleanup();
+            console.warn(`Streaming request failed while piping response body: ${error?.message ?? error}`);
+            if (!to.writableEnded) {
+                to.end();
+            }
         });
     } else {
         to.end();
@@ -758,7 +817,7 @@ export async function forwardFetchResponse(from, to) {
 /**
  * Makes an HTTP/2 request to the specified endpoint.
  *
- * @deprecated Use `node-fetch` if possible.
+ * @deprecated Use the native Fetch API if possible.
  * @param {string} endpoint URL to make the request to
  * @param {string} method HTTP method to use
  * @param {string} body Request body
